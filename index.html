@@ -283,65 +283,6 @@ function setRowStatus(item, text, cls) {
   statusEl.className = 'status' + (cls ? ' ' + cls : '');
 }
 
-// 페이지별 텍스트 레이아웃을 모두 모아 중복 제거 후, 문서 흐름 순서로 정렬해
-// 문단 단위 텍스트 블록으로 재구성한다. (rhwp의 페이지 배치 렌더링에는 복잡한
-// 문서에서 겹침/오배치 버그가 있어, 페이지 단위가 아니라 문서 전체에서 유효한
-// run을 모아 재정렬하는 방식으로 우회한다.)
-function extractOrderedParagraphs(doc, pageCount) {
-  const paragraphCount = doc.getParagraphCount();
-  const allRuns = [];
-  for (let p = 0; p < pageCount; p++) {
-    let layout;
-    try {
-      layout = JSON.parse(doc.getPageTextLayout(p));
-    } catch (e) {
-      continue;
-    }
-    for (const r of layout.runs || []) allRuns.push(r);
-  }
-
-  const seen = new Map();
-  for (const r of allRuns) {
-    if (typeof r.paraIdx !== 'number' || !Number.isFinite(r.paraIdx)) continue;
-    if (r.paraIdx < 0 || r.paraIdx >= paragraphCount) continue; // 손상된 페이지의 잘못된 인덱스 걸러내기
-    const secIdx = r.secIdx ?? 0;
-    const controlIdx = r.controlIdx ?? 0;
-    const cellIdx = r.cellIdx ?? 0;
-    const cellParaIdx = r.cellParaIdx ?? 0;
-    const charStart = r.charStart ?? 0;
-    const key = [secIdx, controlIdx, cellIdx, cellParaIdx, r.paraIdx, charStart].join(':');
-    if (!seen.has(key)) {
-      seen.set(key, { secIdx, controlIdx, cellIdx, cellParaIdx, paraIdx: r.paraIdx,
-        parentParaIdx: r.parentParaIdx ?? r.paraIdx, charStart, text: r.text || '' });
-    }
-  }
-
-  const uniqueRuns = [...seen.values()];
-  uniqueRuns.sort((a, b) =>
-    (a.parentParaIdx - b.parentParaIdx) ||
-    (a.controlIdx - b.controlIdx) ||
-    (a.cellIdx - b.cellIdx) ||
-    (a.cellParaIdx - b.cellParaIdx) ||
-    (a.paraIdx - b.paraIdx) ||
-    (a.charStart - b.charStart)
-  );
-
-  const paragraphs = [];
-  let curKey = null, curText = '';
-  for (const r of uniqueRuns) {
-    const gkey = [r.secIdx, r.controlIdx, r.cellIdx, r.cellParaIdx, r.paraIdx].join(':');
-    if (gkey !== curKey) {
-      if (curText.trim()) paragraphs.push(curText);
-      curText = r.text;
-      curKey = gkey;
-    } else {
-      curText += r.text;
-    }
-  }
-  if (curText.trim()) paragraphs.push(curText);
-  return paragraphs;
-}
-
 function svgToImage(svgString) {
   return new Promise((resolve, reject) => {
     const blob = new Blob([svgString], { type: 'image/svg+xml' });
@@ -360,32 +301,15 @@ function scaleSvgSize(svgString, scale) {
   );
 }
 
-// 문단 목록을 페이지 수만큼, 글자 수 비례로 순서대로 나눈다 (보이지 않는
-// 텍스트 레이어를 페이지별로 분산 배치하기 위함 — 어느 페이지에 놓이든
-// 전체 문서에서 읽는 순서와 내용은 항상 보존된다).
-function chunkParagraphsByPage(paragraphs, pageCount) {
-  const chunks = Array.from({ length: pageCount }, () => []);
-  const totalChars = paragraphs.reduce((s, p) => s + p.length, 0) || 1;
-  const targetPerPage = totalChars / pageCount;
-  let pageIdx = 0, acc = 0;
-  for (const p of paragraphs) {
-    chunks[pageIdx].push(p);
-    acc += p.length;
-    if (acc >= targetPerPage && pageIdx < pageCount - 1) {
-      pageIdx++;
-      acc = 0;
-    }
-  }
-  return chunks;
-}
-
 // 페이지를 원본 그대로 이미지로 그려 넣고(시각적 레이아웃 보존), 그 위에
-// 보이지 않는 실제 텍스트를 겹쳐서 복사/검색/AI 입력이 가능하게 한다.
-// (스캔 문서를 OCR 처리한 PDF와 동일한 원리)
-async function buildHybridPdf(doc, pageCount, paragraphs, fontBase64, title) {
-  const chunks = chunkParagraphsByPage(paragraphs, pageCount);
+// 보이지 않는 실제 텍스트를 각 글자의 실제 좌표에 정확히 겹쳐서 마우스로
+// 드래그 선택/복사/검색/AI 입력이 모두 되게 한다. (스캔 문서 OCR PDF와 동일한
+// 원리 — 텍스트를 화면 위 아무 곳에나 순서대로 쌓으면 눈에 보이는 글자를
+// 마우스로 긁어도 아무것도 잡히지 않으므로, 반드시 같은 좌표에 둬야 한다.)
+async function buildHybridPdf(doc, pageCount, fontBase64, title) {
   const canvas = document.createElement('canvas');
   const ctx2d = canvas.getContext('2d');
+  const PX_TO_PT = 0.75; // 96dpi px -> 72dpi pt
   let pdf = null;
 
   for (let i = 0; i < pageCount; i++) {
@@ -400,8 +324,8 @@ async function buildHybridPdf(doc, pageCount, paragraphs, fontBase64, title) {
     ctx2d.drawImage(img, 0, 0, canvas.width, canvas.height);
     const dataUrl = canvas.toDataURL('image/jpeg', JPEG_QUALITY);
 
-    const widthPt = (img.width / RASTER_SCALE) * 0.75;
-    const heightPt = (img.height / RASTER_SCALE) * 0.75;
+    const widthPt = (img.width / RASTER_SCALE) * PX_TO_PT;
+    const heightPt = (img.height / RASTER_SCALE) * PX_TO_PT;
 
     if (!pdf) {
       pdf = new jsPDF({ unit: 'pt', format: [widthPt, heightPt], putOnlyUsedFonts: true, compress: true });
@@ -414,17 +338,21 @@ async function buildHybridPdf(doc, pageCount, paragraphs, fontBase64, title) {
     pdf.addImage(dataUrl, 'JPEG', 0, 0, widthPt, heightPt);
 
     pdf.setFont(FONT_NAME);
-    pdf.setFontSize(9);
-    const margin = 20;
-    const maxWidth = widthPt - margin * 2;
-    let y = margin;
-    for (const para of chunks[i]) {
-      const lines = pdf.splitTextToSize(para, maxWidth);
-      for (const line of lines) {
-        pdf.text(line, margin, y, { renderingMode: 'invisible' });
-        y += 11;
+    let layout;
+    try {
+      layout = JSON.parse(doc.getPageTextLayout(i));
+    } catch (e) {
+      layout = { runs: [] };
+    }
+    for (const r of layout.runs || []) {
+      if (!r.text || !r.text.trim()) continue;
+      const fontSize = Math.max((r.fontSize || 10) * PX_TO_PT, 4);
+      pdf.setFontSize(fontSize);
+      try {
+        pdf.text(r.text, (r.x ?? 0) * PX_TO_PT, (r.y ?? 0) * PX_TO_PT, { renderingMode: 'invisible' });
+      } catch (e) {
+        // 개별 run 배치 실패는 건너뛰고 계속 진행
       }
-      y += 4;
     }
   }
 
@@ -443,8 +371,7 @@ async function convertItem(item) {
     const pageCount = doc.pageCount();
     if (!pageCount || pageCount < 1) throw new Error('페이지를 찾을 수 없습니다');
 
-    const paragraphs = extractOrderedParagraphs(doc, pageCount);
-    const blob = await buildHybridPdf(doc, pageCount, paragraphs, fontBase64, item.file.name);
+    const blob = await buildHybridPdf(doc, pageCount, fontBase64, item.file.name);
     doc.free?.();
 
     item.status = 'done';
