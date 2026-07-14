@@ -49,9 +49,19 @@
   }
   p.sub {
     color: var(--muted);
-    margin: 0 0 28px;
+    margin: 0 0 12px;
     font-size: 14px;
     line-height: 1.5;
+  }
+  p.sub2 {
+    color: var(--muted);
+    margin: 0 0 28px;
+    font-size: 13px;
+    line-height: 1.5;
+    background: color-mix(in srgb, var(--accent) 6%, transparent);
+    border: 1px solid color-mix(in srgb, var(--accent) 25%, var(--border));
+    border-radius: 8px;
+    padding: 10px 12px;
   }
   .dropzone {
     border: 2px dashed var(--border);
@@ -158,6 +168,11 @@
     .hwp / .hwpx 파일을 여러 개 올리면 모두 PDF로 변환합니다.
     변환은 이 브라우저 안에서만 이루어지며, 파일이 어떤 서버로도 전송되지 않습니다.
   </p>
+  <p class="sub2">
+    이 도구는 <strong>문서 원본 레이아웃을 그대로 재현하기보다, 텍스트를 정확하고 완전하게 추출</strong>하는 데
+    초점을 맞췄습니다 (ChatGPT 등 AI에 넣기 좋도록 실제 텍스트로 저장 — 이미지가 아니라 복사/검색이 됩니다).
+    표나 서식이 있는 문서는 원본과 배치가 다르게 보일 수 있습니다.
+  </p>
 
   <div id="dropzone" class="dropzone">
     <div><strong>클릭</strong>하거나 파일을 이곳에 <strong>드래그</strong>하세요</div>
@@ -173,7 +188,7 @@
 
   <footer>
     변환 엔진: <a href="https://github.com/edwardkim/rhwp" target="_blank" rel="noopener">rhwp</a> (오픈소스, MIT License) ·
-    폰트가 없는 환경에서는 원본과 글꼴 모양이 다를 수 있습니다.
+    글꼴: <a href="https://github.com/orioncactus/pretendard" target="_blank" rel="noopener">Pretendard</a>
   </footer>
 </main>
 
@@ -182,7 +197,9 @@ import { HwpDocument, default as initRhwp } from 'https://cdn.jsdelivr.net/npm/@
 import { jsPDF } from 'https://cdn.jsdelivr.net/npm/jspdf@2.5.2/+esm';
 import JSZip from 'https://cdn.jsdelivr.net/npm/jszip@3.10.1/+esm';
 
-const RASTER_SCALE = 2; // 2x 해상도로 래스터화 (선명도용)
+const FONT_URL = 'https://cdn.jsdelivr.net/npm/pretendard@1.3.9/dist/public/static/alternative/Pretendard-Regular.ttf';
+const FONT_NAME = 'Pretendard';
+const FONT_FILE = 'Pretendard-Regular.ttf';
 
 globalThis.measureTextWidth = (font, text) => {
   const ctx = document.createElement('canvas').getContext('2d');
@@ -190,7 +207,19 @@ globalThis.measureTextWidth = (font, text) => {
   return ctx.measureText(text).width;
 };
 
-let rhwpReady = initRhwp();
+const rhwpReady = initRhwp();
+const fontBase64Ready = loadFontBase64(FONT_URL);
+
+async function loadFontBase64(url) {
+  const resp = await fetch(url);
+  const blob = await resp.blob();
+  return await new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result.split(',')[1]);
+    reader.onerror = reject;
+    reader.readAsDataURL(blob);
+  });
+}
 
 const dropzone = document.getElementById('dropzone');
 const fileInput = document.getElementById('fileInput');
@@ -198,7 +227,7 @@ const queueEl = document.getElementById('queue');
 const actionsEl = document.getElementById('actions');
 const downloadAllBtn = document.getElementById('downloadAllBtn');
 
-const items = []; // { id, file, status, blob, error, rowEl }
+const items = [];
 
 dropzone.addEventListener('click', () => fileInput.click());
 fileInput.addEventListener('change', () => {
@@ -252,26 +281,119 @@ function setRowStatus(item, text, cls) {
   statusEl.className = 'status' + (cls ? ' ' + cls : '');
 }
 
+// 페이지별 텍스트 레이아웃을 모두 모아 중복 제거 후, 문서 흐름 순서로 정렬해
+// 문단 단위 텍스트 블록으로 재구성한다. (rhwp의 페이지 배치 렌더링에는 복잡한
+// 문서에서 겹침/오배치 버그가 있어, 페이지 단위가 아니라 문서 전체에서 유효한
+// run을 모아 재정렬하는 방식으로 우회한다.)
+function extractOrderedParagraphs(doc, pageCount) {
+  const paragraphCount = doc.getParagraphCount();
+  const allRuns = [];
+  for (let p = 0; p < pageCount; p++) {
+    let layout;
+    try {
+      layout = JSON.parse(doc.getPageTextLayout(p));
+    } catch (e) {
+      continue;
+    }
+    for (const r of layout.runs || []) allRuns.push(r);
+  }
+
+  const seen = new Map();
+  for (const r of allRuns) {
+    if (typeof r.paraIdx !== 'number' || !Number.isFinite(r.paraIdx)) continue;
+    if (r.paraIdx < 0 || r.paraIdx >= paragraphCount) continue; // 손상된 페이지의 잘못된 인덱스 걸러내기
+    const secIdx = r.secIdx ?? 0;
+    const controlIdx = r.controlIdx ?? 0;
+    const cellIdx = r.cellIdx ?? 0;
+    const cellParaIdx = r.cellParaIdx ?? 0;
+    const charStart = r.charStart ?? 0;
+    const key = [secIdx, controlIdx, cellIdx, cellParaIdx, r.paraIdx, charStart].join(':');
+    if (!seen.has(key)) {
+      seen.set(key, { secIdx, controlIdx, cellIdx, cellParaIdx, paraIdx: r.paraIdx,
+        parentParaIdx: r.parentParaIdx ?? r.paraIdx, charStart, text: r.text || '' });
+    }
+  }
+
+  const uniqueRuns = [...seen.values()];
+  uniqueRuns.sort((a, b) =>
+    (a.parentParaIdx - b.parentParaIdx) ||
+    (a.controlIdx - b.controlIdx) ||
+    (a.cellIdx - b.cellIdx) ||
+    (a.cellParaIdx - b.cellParaIdx) ||
+    (a.paraIdx - b.paraIdx) ||
+    (a.charStart - b.charStart)
+  );
+
+  const paragraphs = [];
+  let curKey = null, curText = '';
+  for (const r of uniqueRuns) {
+    const gkey = [r.secIdx, r.controlIdx, r.cellIdx, r.cellParaIdx, r.paraIdx].join(':');
+    if (gkey !== curKey) {
+      if (curText.trim()) paragraphs.push(curText);
+      curText = r.text;
+      curKey = gkey;
+    } else {
+      curText += r.text;
+    }
+  }
+  if (curText.trim()) paragraphs.push(curText);
+  return paragraphs;
+}
+
+function buildTextPdf(paragraphs, fontBase64, title) {
+  const pdf = new jsPDF({ unit: 'pt', format: 'a4', putOnlyUsedFonts: true, compress: true });
+  pdf.addFileToVFS(FONT_FILE, fontBase64);
+  pdf.addFont(FONT_FILE, FONT_NAME, 'normal');
+  pdf.setFont(FONT_NAME);
+
+  const pageWidth = pdf.internal.pageSize.getWidth();
+  const pageHeight = pdf.internal.pageSize.getHeight();
+  const margin = 42;
+  const fontSize = 10.5;
+  const lineHeight = fontSize * 1.5;
+  const maxWidth = pageWidth - margin * 2;
+
+  pdf.setFontSize(fontSize);
+  pdf.setProperties({ title });
+
+  let y = margin;
+  const ensureRoom = () => {
+    if (y > pageHeight - margin) {
+      pdf.addPage();
+      y = margin;
+    }
+  };
+
+  if (!paragraphs.length) {
+    pdf.text('(추출된 텍스트가 없습니다)', margin, y);
+  }
+
+  for (const para of paragraphs) {
+    const lines = pdf.splitTextToSize(para, maxWidth);
+    for (const line of lines) {
+      ensureRoom();
+      pdf.text(line, margin, y);
+      y += lineHeight;
+    }
+    y += lineHeight * 0.4; // 문단 사이 여백
+  }
+
+  return pdf.output('blob');
+}
+
 function svgToImage(svgString) {
   return new Promise((resolve, reject) => {
     const blob = new Blob([svgString], { type: 'image/svg+xml' });
     const url = URL.createObjectURL(blob);
     const img = new Image();
     img.onload = () => { URL.revokeObjectURL(url); resolve(img); };
-    img.onerror = (e) => { URL.revokeObjectURL(url); reject(new Error('페이지 렌더링 실패')); };
+    img.onerror = () => { URL.revokeObjectURL(url); reject(new Error('페이지 렌더링 실패')); };
     img.src = url;
   });
 }
 
-function scaleSvgSize(svgString, scale) {
-  return svgString.replace(
-    /^(<svg\b[^>]*?\swidth=")([\d.]+)("[^>]*?\sheight=")([\d.]+)(")/,
-    (m, p1, w, p3, h, p5) => `${p1}${parseFloat(w) * scale}${p3}${parseFloat(h) * scale}${p5}`
-  );
-}
-
 async function convertItem(item) {
-  await rhwpReady;
+  const [, fontBase64] = await Promise.all([rhwpReady, fontBase64Ready]);
   setRowStatus(item, '변환 중', null);
   try {
     const bytes = new Uint8Array(await item.file.arrayBuffer());
@@ -279,37 +401,10 @@ async function convertItem(item) {
     const pageCount = doc.pageCount();
     if (!pageCount || pageCount < 1) throw new Error('페이지를 찾을 수 없습니다');
 
-    let pdf = null;
-    const canvas = document.createElement('canvas');
-    const ctx2d = canvas.getContext('2d');
-
-    for (let i = 0; i < pageCount; i++) {
-      setRowStatus(item, `변환 중 (${i + 1}/${pageCount})`, null);
-      const rawSvg = doc.renderPageSvg(i);
-      const scaledSvg = scaleSvgSize(rawSvg, RASTER_SCALE);
-      const img = await svgToImage(scaledSvg);
-
-      canvas.width = img.width;
-      canvas.height = img.height;
-      ctx2d.fillStyle = '#ffffff';
-      ctx2d.fillRect(0, 0, canvas.width, canvas.height);
-      ctx2d.drawImage(img, 0, 0, canvas.width, canvas.height);
-      const dataUrl = canvas.toDataURL('image/jpeg', 0.92);
-
-      const widthPt = (img.width / RASTER_SCALE) * 0.75;
-      const heightPt = (img.height / RASTER_SCALE) * 0.75;
-
-      if (!pdf) {
-        pdf = new jsPDF({ unit: 'pt', format: [widthPt, heightPt] });
-      } else {
-        pdf.addPage([widthPt, heightPt]);
-      }
-      pdf.addImage(dataUrl, 'JPEG', 0, 0, widthPt, heightPt);
-    }
-
+    const paragraphs = extractOrderedParagraphs(doc, pageCount);
     doc.free?.();
 
-    const blob = pdf.output('blob');
+    const blob = buildTextPdf(paragraphs, fontBase64, item.file.name);
     item.status = 'done';
     item.blob = blob;
     item.pdfName = item.file.name.replace(/\.(hwp|hwpx)$/i, '.pdf');
