@@ -169,9 +169,9 @@
     변환은 이 브라우저 안에서만 이루어지며, 파일이 어떤 서버로도 전송되지 않습니다.
   </p>
   <p class="sub2">
-    이 도구는 <strong>문서 원본 레이아웃을 그대로 재현하기보다, 텍스트를 정확하고 완전하게 추출</strong>하는 데
-    초점을 맞췄습니다 (ChatGPT 등 AI에 넣기 좋도록 실제 텍스트로 저장 — 이미지가 아니라 복사/검색이 됩니다).
-    표나 서식이 있는 문서는 원본과 배치가 다르게 보일 수 있습니다.
+    화면에 보이는 모양은 <strong>원본 레이아웃 그대로</strong>이면서, 그 위에 <strong>보이지 않는 진짜 텍스트</strong>를
+    함께 넣습니다 (스캔 문서 OCR PDF와 같은 방식). 복사·검색·AI 입력 모두 정상 동작합니다.
+    다만 이미지가 포함되어 순수 텍스트 PDF보다 파일 용량은 더 큽니다.
   </p>
 
   <div id="dropzone" class="dropzone">
@@ -188,7 +188,7 @@
 
   <footer>
     변환 엔진: <a href="https://github.com/edwardkim/rhwp" target="_blank" rel="noopener">rhwp</a> (오픈소스, MIT License) ·
-    글꼴: <a href="https://github.com/orioncactus/pretendard" target="_blank" rel="noopener">Pretendard</a>
+    보이지 않는 텍스트 레이어 글꼴: <a href="https://github.com/orioncactus/pretendard" target="_blank" rel="noopener">Pretendard</a>
   </footer>
 </main>
 
@@ -200,6 +200,8 @@ import JSZip from 'https://cdn.jsdelivr.net/npm/jszip@3.10.1/+esm';
 const FONT_URL = 'https://cdn.jsdelivr.net/npm/pretendard@1.3.9/dist/public/static/alternative/Pretendard-Regular.ttf';
 const FONT_NAME = 'Pretendard';
 const FONT_FILE = 'Pretendard-Regular.ttf';
+const RASTER_SCALE = 1.5; // 페이지 이미지 해상도 배율 (선명도/용량 절충)
+const JPEG_QUALITY = 0.85;
 
 globalThis.measureTextWidth = (font, text) => {
   const ctx = document.createElement('canvas').getContext('2d');
@@ -340,47 +342,6 @@ function extractOrderedParagraphs(doc, pageCount) {
   return paragraphs;
 }
 
-function buildTextPdf(paragraphs, fontBase64, title) {
-  const pdf = new jsPDF({ unit: 'pt', format: 'a4', putOnlyUsedFonts: true, compress: true });
-  pdf.addFileToVFS(FONT_FILE, fontBase64);
-  pdf.addFont(FONT_FILE, FONT_NAME, 'normal');
-  pdf.setFont(FONT_NAME);
-
-  const pageWidth = pdf.internal.pageSize.getWidth();
-  const pageHeight = pdf.internal.pageSize.getHeight();
-  const margin = 42;
-  const fontSize = 10.5;
-  const lineHeight = fontSize * 1.5;
-  const maxWidth = pageWidth - margin * 2;
-
-  pdf.setFontSize(fontSize);
-  pdf.setProperties({ title });
-
-  let y = margin;
-  const ensureRoom = () => {
-    if (y > pageHeight - margin) {
-      pdf.addPage();
-      y = margin;
-    }
-  };
-
-  if (!paragraphs.length) {
-    pdf.text('(추출된 텍스트가 없습니다)', margin, y);
-  }
-
-  for (const para of paragraphs) {
-    const lines = pdf.splitTextToSize(para, maxWidth);
-    for (const line of lines) {
-      ensureRoom();
-      pdf.text(line, margin, y);
-      y += lineHeight;
-    }
-    y += lineHeight * 0.4; // 문단 사이 여백
-  }
-
-  return pdf.output('blob');
-}
-
 function svgToImage(svgString) {
   return new Promise((resolve, reject) => {
     const blob = new Blob([svgString], { type: 'image/svg+xml' });
@@ -390,6 +351,87 @@ function svgToImage(svgString) {
     img.onerror = () => { URL.revokeObjectURL(url); reject(new Error('페이지 렌더링 실패')); };
     img.src = url;
   });
+}
+
+function scaleSvgSize(svgString, scale) {
+  return svgString.replace(
+    /^(<svg\b[^>]*?\swidth=")([\d.]+)("[^>]*?\sheight=")([\d.]+)(")/,
+    (m, p1, w, p3, h, p5) => `${p1}${parseFloat(w) * scale}${p3}${parseFloat(h) * scale}${p5}`
+  );
+}
+
+// 문단 목록을 페이지 수만큼, 글자 수 비례로 순서대로 나눈다 (보이지 않는
+// 텍스트 레이어를 페이지별로 분산 배치하기 위함 — 어느 페이지에 놓이든
+// 전체 문서에서 읽는 순서와 내용은 항상 보존된다).
+function chunkParagraphsByPage(paragraphs, pageCount) {
+  const chunks = Array.from({ length: pageCount }, () => []);
+  const totalChars = paragraphs.reduce((s, p) => s + p.length, 0) || 1;
+  const targetPerPage = totalChars / pageCount;
+  let pageIdx = 0, acc = 0;
+  for (const p of paragraphs) {
+    chunks[pageIdx].push(p);
+    acc += p.length;
+    if (acc >= targetPerPage && pageIdx < pageCount - 1) {
+      pageIdx++;
+      acc = 0;
+    }
+  }
+  return chunks;
+}
+
+// 페이지를 원본 그대로 이미지로 그려 넣고(시각적 레이아웃 보존), 그 위에
+// 보이지 않는 실제 텍스트를 겹쳐서 복사/검색/AI 입력이 가능하게 한다.
+// (스캔 문서를 OCR 처리한 PDF와 동일한 원리)
+async function buildHybridPdf(doc, pageCount, paragraphs, fontBase64, title) {
+  const chunks = chunkParagraphsByPage(paragraphs, pageCount);
+  const canvas = document.createElement('canvas');
+  const ctx2d = canvas.getContext('2d');
+  let pdf = null;
+
+  for (let i = 0; i < pageCount; i++) {
+    const rawSvg = doc.renderPageSvg(i);
+    const scaledSvg = scaleSvgSize(rawSvg, RASTER_SCALE);
+    const img = await svgToImage(scaledSvg);
+
+    canvas.width = img.width;
+    canvas.height = img.height;
+    ctx2d.fillStyle = '#ffffff';
+    ctx2d.fillRect(0, 0, canvas.width, canvas.height);
+    ctx2d.drawImage(img, 0, 0, canvas.width, canvas.height);
+    const dataUrl = canvas.toDataURL('image/jpeg', JPEG_QUALITY);
+
+    const widthPt = (img.width / RASTER_SCALE) * 0.75;
+    const heightPt = (img.height / RASTER_SCALE) * 0.75;
+
+    if (!pdf) {
+      pdf = new jsPDF({ unit: 'pt', format: [widthPt, heightPt], putOnlyUsedFonts: true, compress: true });
+      pdf.addFileToVFS(FONT_FILE, fontBase64);
+      pdf.addFont(FONT_FILE, FONT_NAME, 'normal');
+      pdf.setProperties({ title });
+    } else {
+      pdf.addPage([widthPt, heightPt]);
+    }
+    pdf.addImage(dataUrl, 'JPEG', 0, 0, widthPt, heightPt);
+
+    pdf.setFont(FONT_NAME);
+    pdf.setFontSize(9);
+    const margin = 20;
+    const maxWidth = widthPt - margin * 2;
+    let y = margin;
+    for (const para of chunks[i]) {
+      const lines = pdf.splitTextToSize(para, maxWidth);
+      for (const line of lines) {
+        pdf.text(line, margin, y, { renderingMode: 'invisible' });
+        y += 11;
+      }
+      y += 4;
+    }
+  }
+
+  if (!pdf) {
+    pdf = new jsPDF({ unit: 'pt', format: 'a4' });
+  }
+  return pdf.output('blob');
 }
 
 async function convertItem(item) {
@@ -402,9 +444,9 @@ async function convertItem(item) {
     if (!pageCount || pageCount < 1) throw new Error('페이지를 찾을 수 없습니다');
 
     const paragraphs = extractOrderedParagraphs(doc, pageCount);
+    const blob = await buildHybridPdf(doc, pageCount, paragraphs, fontBase64, item.file.name);
     doc.free?.();
 
-    const blob = buildTextPdf(paragraphs, fontBase64, item.file.name);
     item.status = 'done';
     item.blob = blob;
     item.pdfName = item.file.name.replace(/\.(hwp|hwpx)$/i, '.pdf');
