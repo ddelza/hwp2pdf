@@ -310,6 +310,10 @@ async function buildHybridPdf(doc, pageCount, fontBase64, title) {
   const canvas = document.createElement('canvas');
   const ctx2d = canvas.getContext('2d');
   const PX_TO_PT = 0.75; // 96dpi px -> 72dpi pt
+  const paragraphCount = doc.getParagraphCount();
+  const placedKeys = new Set(); // rhwp 페이지 배치 버그로 같은 run이 여러 페이지에
+  // 나타날 수 있어, 텍스트 레이어에는 각 run을 한 번만 배치한다 (LLM이 같은
+  // 내용을 중복으로 읽지 않도록). 위치는 그 run이 실제로 나온 페이지 좌표를 그대로 쓴다.
   let pdf = null;
 
   for (let i = 0; i < pageCount; i++) {
@@ -346,6 +350,12 @@ async function buildHybridPdf(doc, pageCount, fontBase64, title) {
     }
     for (const r of layout.runs || []) {
       if (!r.text || !r.text.trim()) continue;
+      if (typeof r.paraIdx !== 'number' || !Number.isFinite(r.paraIdx)) continue;
+      if (r.paraIdx < 0 || r.paraIdx >= paragraphCount) continue; // 손상된 페이지의 잘못된 인덱스 걸러내기
+      const key = [r.secIdx ?? 0, r.controlIdx ?? 0, r.cellIdx ?? 0, r.cellParaIdx ?? 0, r.paraIdx, r.charStart ?? 0].join(':');
+      if (placedKeys.has(key)) continue;
+      placedKeys.add(key);
+
       const fontSize = Math.max((r.fontSize || 10) * PX_TO_PT, 4);
       pdf.setFontSize(fontSize);
       try {
