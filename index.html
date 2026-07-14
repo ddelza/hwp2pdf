@@ -1,0 +1,363 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>한글(HWP/HWPX) → PDF 일괄 변환</title>
+<style>
+  :root {
+    --bg: #f7f7f8;
+    --card: #ffffff;
+    --border: #e2e2e5;
+    --text: #1c1c1f;
+    --muted: #6b6b72;
+    --accent: #2f6fed;
+    --accent-hover: #255bc7;
+    --ok: #1a8a4a;
+    --err: #d1414a;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #17181c;
+      --card: #202127;
+      --border: #33343b;
+      --text: #ececef;
+      --muted: #96969e;
+      --accent: #5b8dff;
+      --accent-hover: #7ba0ff;
+      --ok: #3fbf76;
+      --err: #ef6a72;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Malgun Gothic", "맑은 고딕", sans-serif;
+    display: flex;
+    justify-content: center;
+    padding: 40px 16px;
+  }
+  main {
+    width: 100%;
+    max-width: 720px;
+  }
+  h1 {
+    font-size: 22px;
+    margin: 0 0 6px;
+  }
+  p.sub {
+    color: var(--muted);
+    margin: 0 0 28px;
+    font-size: 14px;
+    line-height: 1.5;
+  }
+  .dropzone {
+    border: 2px dashed var(--border);
+    border-radius: 12px;
+    padding: 36px 20px;
+    text-align: center;
+    background: var(--card);
+    cursor: pointer;
+    transition: border-color .15s, background .15s;
+  }
+  .dropzone.dragover {
+    border-color: var(--accent);
+    background: color-mix(in srgb, var(--accent) 8%, var(--card));
+  }
+  .dropzone strong { color: var(--accent); }
+  .dropzone .hint {
+    color: var(--muted);
+    font-size: 13px;
+    margin-top: 6px;
+  }
+  input[type=file] { display: none; }
+
+  .queue {
+    margin-top: 24px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 10px 14px;
+  }
+  .row .name {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 14px;
+  }
+  .row .status {
+    font-size: 13px;
+    color: var(--muted);
+    white-space: nowrap;
+  }
+  .row .status.ok { color: var(--ok); }
+  .row .status.err { color: var(--err); }
+  .row .dl {
+    font-size: 13px;
+    color: var(--accent);
+    text-decoration: none;
+    white-space: nowrap;
+  }
+  .row .dl:hover { color: var(--accent-hover); }
+
+  .spinner {
+    width: 14px; height: 14px;
+    border-radius: 50%;
+    border: 2px solid var(--border);
+    border-top-color: var(--accent);
+    animation: spin 0.7s linear infinite;
+    flex-shrink: 0;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  .actions {
+    margin-top: 20px;
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+  }
+  button.primary {
+    background: var(--accent);
+    color: #fff;
+    border: none;
+    border-radius: 8px;
+    padding: 10px 18px;
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  button.primary:hover { background: var(--accent-hover); }
+  button.primary:disabled {
+    opacity: .5;
+    cursor: not-allowed;
+  }
+  footer {
+    margin-top: 28px;
+    color: var(--muted);
+    font-size: 12px;
+    line-height: 1.6;
+  }
+</style>
+</head>
+<body>
+<main>
+  <h1>한글 파일 → PDF 일괄 변환</h1>
+  <p class="sub">
+    .hwp / .hwpx 파일을 여러 개 올리면 모두 PDF로 변환합니다.
+    변환은 이 브라우저 안에서만 이루어지며, 파일이 어떤 서버로도 전송되지 않습니다.
+  </p>
+
+  <div id="dropzone" class="dropzone">
+    <div><strong>클릭</strong>하거나 파일을 이곳에 <strong>드래그</strong>하세요</div>
+    <div class="hint">.hwp, .hwpx 여러 개 선택 가능</div>
+    <input id="fileInput" type="file" accept=".hwp,.hwpx" multiple>
+  </div>
+
+  <div id="queue" class="queue"></div>
+
+  <div id="actions" class="actions" style="display:none">
+    <button id="downloadAllBtn" class="primary">전체 ZIP으로 다운로드</button>
+  </div>
+
+  <footer>
+    변환 엔진: <a href="https://github.com/edwardkim/rhwp" target="_blank" rel="noopener">rhwp</a> (오픈소스, MIT License) ·
+    폰트가 없는 환경에서는 원본과 글꼴 모양이 다를 수 있습니다.
+  </footer>
+</main>
+
+<script type="module">
+import { HwpDocument, default as initRhwp } from 'https://cdn.jsdelivr.net/npm/@rhwp/core/+esm';
+import { jsPDF } from 'https://cdn.jsdelivr.net/npm/jspdf@2.5.2/+esm';
+import JSZip from 'https://cdn.jsdelivr.net/npm/jszip@3.10.1/+esm';
+
+const RASTER_SCALE = 2; // 2x 해상도로 래스터화 (선명도용)
+
+globalThis.measureTextWidth = (font, text) => {
+  const ctx = document.createElement('canvas').getContext('2d');
+  ctx.font = font;
+  return ctx.measureText(text).width;
+};
+
+let rhwpReady = initRhwp();
+
+const dropzone = document.getElementById('dropzone');
+const fileInput = document.getElementById('fileInput');
+const queueEl = document.getElementById('queue');
+const actionsEl = document.getElementById('actions');
+const downloadAllBtn = document.getElementById('downloadAllBtn');
+
+const items = []; // { id, file, status, blob, error, rowEl }
+
+dropzone.addEventListener('click', () => fileInput.click());
+fileInput.addEventListener('change', () => {
+  addFiles([...fileInput.files]);
+  fileInput.value = '';
+});
+['dragenter', 'dragover'].forEach(evt =>
+  dropzone.addEventListener(evt, (e) => {
+    e.preventDefault();
+    dropzone.classList.add('dragover');
+  })
+);
+['dragleave', 'drop'].forEach(evt =>
+  dropzone.addEventListener(evt, (e) => {
+    e.preventDefault();
+    dropzone.classList.remove('dragover');
+  })
+);
+dropzone.addEventListener('drop', (e) => {
+  const files = [...(e.dataTransfer?.files || [])].filter(f => /\.(hwp|hwpx)$/i.test(f.name));
+  addFiles(files);
+});
+
+function addFiles(files) {
+  for (const file of files) {
+    if (!/\.(hwp|hwpx)$/i.test(file.name)) continue;
+    const id = crypto.randomUUID();
+    const rowEl = document.createElement('div');
+    rowEl.className = 'row';
+    rowEl.innerHTML = `
+      <div class="spinner"></div>
+      <div class="name">${escapeHtml(file.name)}</div>
+      <div class="status">대기 중</div>
+    `;
+    queueEl.appendChild(rowEl);
+    const item = { id, file, status: 'pending', rowEl };
+    items.push(item);
+    convertItem(item);
+  }
+}
+
+function escapeHtml(s) {
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+function setRowStatus(item, text, cls) {
+  const statusEl = item.rowEl.querySelector('.status');
+  statusEl.textContent = text;
+  statusEl.className = 'status' + (cls ? ' ' + cls : '');
+}
+
+function svgToImage(svgString) {
+  return new Promise((resolve, reject) => {
+    const blob = new Blob([svgString], { type: 'image/svg+xml' });
+    const url = URL.createObjectURL(blob);
+    const img = new Image();
+    img.onload = () => { URL.revokeObjectURL(url); resolve(img); };
+    img.onerror = (e) => { URL.revokeObjectURL(url); reject(new Error('페이지 렌더링 실패')); };
+    img.src = url;
+  });
+}
+
+function scaleSvgSize(svgString, scale) {
+  return svgString.replace(
+    /^(<svg\b[^>]*?\swidth=")([\d.]+)("[^>]*?\sheight=")([\d.]+)(")/,
+    (m, p1, w, p3, h, p5) => `${p1}${parseFloat(w) * scale}${p3}${parseFloat(h) * scale}${p5}`
+  );
+}
+
+async function convertItem(item) {
+  await rhwpReady;
+  setRowStatus(item, '변환 중', null);
+  try {
+    const bytes = new Uint8Array(await item.file.arrayBuffer());
+    const doc = new HwpDocument(bytes);
+    const pageCount = doc.pageCount();
+    if (!pageCount || pageCount < 1) throw new Error('페이지를 찾을 수 없습니다');
+
+    let pdf = null;
+    const canvas = document.createElement('canvas');
+    const ctx2d = canvas.getContext('2d');
+
+    for (let i = 0; i < pageCount; i++) {
+      setRowStatus(item, `변환 중 (${i + 1}/${pageCount})`, null);
+      const rawSvg = doc.renderPageSvg(i);
+      const scaledSvg = scaleSvgSize(rawSvg, RASTER_SCALE);
+      const img = await svgToImage(scaledSvg);
+
+      canvas.width = img.width;
+      canvas.height = img.height;
+      ctx2d.fillStyle = '#ffffff';
+      ctx2d.fillRect(0, 0, canvas.width, canvas.height);
+      ctx2d.drawImage(img, 0, 0, canvas.width, canvas.height);
+      const dataUrl = canvas.toDataURL('image/jpeg', 0.92);
+
+      const widthPt = (img.width / RASTER_SCALE) * 0.75;
+      const heightPt = (img.height / RASTER_SCALE) * 0.75;
+
+      if (!pdf) {
+        pdf = new jsPDF({ unit: 'pt', format: [widthPt, heightPt] });
+      } else {
+        pdf.addPage([widthPt, heightPt]);
+      }
+      pdf.addImage(dataUrl, 'JPEG', 0, 0, widthPt, heightPt);
+    }
+
+    doc.free?.();
+
+    const blob = pdf.output('blob');
+    item.status = 'done';
+    item.blob = blob;
+    item.pdfName = item.file.name.replace(/\.(hwp|hwpx)$/i, '.pdf');
+
+    setRowStatus(item, '완료', 'ok');
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = item.pdfName;
+    link.className = 'dl';
+    link.textContent = 'PDF 다운로드';
+    item.rowEl.querySelector('.spinner').remove();
+    item.rowEl.appendChild(link);
+  } catch (e) {
+    console.error(e);
+    item.status = 'error';
+    item.error = e.message || String(e);
+    setRowStatus(item, `실패: ${item.error}`, 'err');
+    item.rowEl.querySelector('.spinner')?.remove();
+  }
+  updateActions();
+}
+
+function updateActions() {
+  const doneItems = items.filter(i => i.status === 'done');
+  const stillWorking = items.some(i => i.status === 'pending');
+  actionsEl.style.display = items.length ? 'flex' : 'none';
+  downloadAllBtn.disabled = doneItems.length === 0 || stillWorking;
+  downloadAllBtn.textContent = stillWorking
+    ? '변환 중...'
+    : `전체 ZIP으로 다운로드 (${doneItems.length}개)`;
+}
+
+downloadAllBtn.addEventListener('click', async () => {
+  const doneItems = items.filter(i => i.status === 'done');
+  if (!doneItems.length) return;
+  const zip = new JSZip();
+  for (const item of doneItems) {
+    zip.file(item.pdfName, item.blob);
+  }
+  const zipBlob = await zip.generateAsync({ type: 'blob' });
+  const url = URL.createObjectURL(zipBlob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'converted-pdfs.zip';
+  a.click();
+  URL.revokeObjectURL(url);
+});
+</script>
+</body>
+</html>
